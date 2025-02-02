@@ -28,6 +28,8 @@ class Program
 			// Ler o arquivo G-code
 			var gcodeLines = GCodeFileHandler.ReadGCodeFile(inputFilePath);
 
+			var RotationalConverter = new RotationalConverter();
+
 			// Converter coordenadas Y para rotação da mesa (100 mm = 360 graus)
 			var rotationalGcodeLines = RotationalConverter.ConvertToRotational(gcodeLines);
 
@@ -44,39 +46,23 @@ class Program
 	}
 }
 
-// Classe para manipulação de arquivos G-code
-public static class GCodeFileHandler
-{
-	public static List<string> ReadGCodeFile(string filePath)
-	{
-		var lines = new List<string>();
-		using (var reader = new StreamReader(filePath))
-		{
-			string line;
-			while ((line = reader.ReadLine()) != null)
-			{
-				lines.Add(line);
-			}
-		}
-		return lines;
-	}
-
-	public static void WriteGCodeFile(string filePath, List<string> lines)
-	{
-		using (var writer = new StreamWriter(filePath))
-		{
-			foreach (var line in lines)
-			{
-				writer.WriteLine(line);
-			}
-		}
-	}
-}
-
 // Classe para conversão de coordenadas Y para rotação da mesa
-public static class RotationalConverter
+public class RotationalConverter
 {
-	public static List<string> ConvertToRotational(List<string> gcodeLines)
+	private readonly int XPrecision;
+	private readonly int YPrecision;
+	private readonly double ThetaConversionFactor;
+
+	// Construtor da classe
+	public RotationalConverter(int xPrecision = 3, int yPrecision = 2, double thetaConversionFactor = 360.0)
+	{
+		XPrecision = xPrecision;
+		YPrecision = yPrecision;
+		ThetaConversionFactor = thetaConversionFactor;
+	}
+
+	// Método para converter coordenadas cartesianas em polares
+	public List<string> ConvertToRotational(List<string> gcodeLines)
 	{
 		var rotationalLines = new List<string>();
 
@@ -85,46 +71,27 @@ public static class RotationalConverter
 			if (line.StartsWith("G0") || line.StartsWith("G1"))
 			{
 				var parts = line.Split(' ');
-				double x = 0, y = 0, z = 0;
-				bool hasX = false, hasY = false, hasZ = false;
+				double x = 0, y = 0;
 
 				foreach (var part in parts)
 				{
 					if (part.StartsWith("X"))
 					{
 						x = double.Parse(part.Substring(1), CultureInfo.InvariantCulture);
-						hasX = true;
 					}
 					else if (part.StartsWith("Y"))
 					{
 						y = double.Parse(part.Substring(1), CultureInfo.InvariantCulture);
-						hasY = true;
-					}
-					else if (part.StartsWith("Z"))
-					{
-						z = double.Parse(part.Substring(1), CultureInfo.InvariantCulture);
-						hasZ = true;
 					}
 				}
 
-				if (hasY)
-				{
-					// Converte Y para rotação da mesa (100 mm = 360 graus)
-					double rotationalY = (y / 100.0) * 360.0;
+				// Calcula as novas coordenadas polares
+				var (r, theta) = CartesianToPolar(x, y);
+				double newX = theta;  // Ângulo em graus
+				double newY = r;      // Raio
 
-					// Substitui Y pelo valor convertido, usando cultura invariável
-					var newParts = parts.Select(p =>
-					{
-						if (p.StartsWith("Y")) return $"Y{rotationalY.ToString("F3", CultureInfo.InvariantCulture)}";
-						return p;
-					}).ToArray();
-
-					rotationalLines.Add(string.Join(" ", newParts));
-				}
-				else
-				{
-					rotationalLines.Add(line); // Mantém a linha inalterada se não tiver Y
-				}
+				// Reconstroi a linha com as novas coordenadas
+				ReconstructLine(rotationalLines, parts, newX, newY);
 			}
 			else
 			{
@@ -134,7 +101,94 @@ public static class RotationalConverter
 
 		return rotationalLines;
 	}
-	public static List<string> DetectLongRotations(List<string> gcodeLines)
+
+	// Método para reconstruir a linha com as novas coordenadas
+	private void ReconstructLine(List<string> rotationalLines, string[] parts, double newX, double newY)
+	{
+		var newLine = new List<string>();
+
+		bool hasX = false;
+		bool hasY = false;
+
+		// Percorre as partes da linha original
+		foreach (var part in parts)
+		{
+			if (part.StartsWith("X"))
+			{
+				// Substitui o valor de X pelo novo valor, aplicando o arredondamento
+				newLine.Add(ReplaceOrAddCoordinate(part, newX, "X", XPrecision));
+				hasX = true;
+			}
+			else if (part.StartsWith("Y"))
+			{
+				// Substitui o valor de Y pelo novo valor, aplicando o arredondamento
+				newLine.Add(ReplaceOrAddCoordinate(part, newY, "Y", YPrecision));
+				hasY = true;
+			}
+			else
+			{
+				// Mantém as outras partes da linha
+				newLine.Add(part);
+			}
+		}
+
+		// Insere X antes de Y, se necessário
+		if (!hasX)
+		{
+			InsertCoordinate(newLine, newX, "X", "Y", XPrecision);
+		}
+
+		// Insere Y depois de X, se necessário
+		if (!hasY)
+		{
+			InsertCoordinate(newLine, newY, "Y", "X", YPrecision);
+		}
+
+		// Junta as partes para formar a nova linha e adiciona à lista de linhas rotacionais
+		rotationalLines.Add(string.Join(" ", newLine));
+	}
+
+	// Função auxiliar para substituir ou adicionar uma coordenada com arredondamento
+	private string ReplaceOrAddCoordinate(string part, double value, string prefix, int precision)
+	{
+		double roundedValue = Math.Round(value, precision);
+		return $"{prefix}{roundedValue.ToString($"F{precision}", CultureInfo.InvariantCulture)}";
+	}
+
+	// Função auxiliar para inserir uma coordenada na posição correta com arredondamento
+	private void InsertCoordinate(List<string> line, double value, string prefix, string referencePrefix, int precision)
+	{
+		double roundedValue = Math.Round(value, precision);
+		int referenceIndex = line.FindIndex(p => p.StartsWith(referencePrefix));
+		if (referenceIndex == -1)
+		{
+			// Se a referência não existir, insere no final
+			line.Add($"{prefix}{roundedValue.ToString($"F{precision}", CultureInfo.InvariantCulture)}");
+		}
+		else
+		{
+			// Insere antes ou depois da referência, dependendo do prefixo
+			if (prefix == "X" && referencePrefix == "Y")
+			{
+				line.Insert(referenceIndex, $"{prefix}{roundedValue.ToString($"F{precision}", CultureInfo.InvariantCulture)}");
+			}
+			else if (prefix == "Y" && referencePrefix == "X")
+			{
+				line.Insert(referenceIndex + 1, $"{prefix}{roundedValue.ToString($"F{precision}", CultureInfo.InvariantCulture)}");
+			}
+		}
+	}
+
+	// Método para converter coordenadas cartesianas em polares
+	public (double, double) CartesianToPolar(double x, double y)
+	{
+		double r = Math.Sqrt(x * x + y * y); // Calcula o raio (hipotenusa)
+		double theta = Math.Atan2(y, x) * (ThetaConversionFactor / (2 * Math.PI)); // Calcula o ângulo com o fator de conversão
+
+		return (r, theta); // Retorna o raio e o ângulo
+	}
+
+public  List<string> DetectLongRotations(List<string> gcodeLines)
 	{
 		var longRotationLines = new List<string>();
 		double previousY = 0;
